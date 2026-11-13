@@ -432,6 +432,7 @@ class AscendConfig:
             "enable_dsa_cp": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
+            "mtp_memory_release": true,
             "enable_pcp_o_proj_weight_sharding": true,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
             "draft_window_size": null,
@@ -581,6 +582,14 @@ class AscendConfig:
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
+    # Plan-D: early release of async-lagged MTP peak tensors. When True, the
+    # DeepSeek-MTP draft path explicitly `del`s the enorm/hnorm outputs right
+    # after eh_proj consumes their cat, so the NPU device-side frees enqueue on
+    # the stream BEFORE the 1168 MB MoE workspace alloc — recovering the ~1 ms
+    # async-free lag that otherwise leaves extra 93.75 MB tensors co-resident
+    # at the peak. Lowers profile-run peak → more KV cache. Zero latency cost
+    # (no synchronize; only reorders release timing). Default ON.
+    mtp_memory_release: bool = True
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None

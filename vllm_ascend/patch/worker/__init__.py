@@ -49,6 +49,7 @@ import vllm_ascend.patch.worker.patch_eagle3_init  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
 import vllm_ascend.patch.worker.patch_dense_layer_sequence_parallel  # noqa
+import vllm_ascend.patch.worker.patch_mtp_early_release  # noqa  # Plan-D: early release of async-lagged MTP peak tensors
 
 # vLLM's use_v2_model_runner may enable the v2 runner without the
 # VLLM_USE_V2_MODEL_RUNNER env var (e.g. based on model architecture).
