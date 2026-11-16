@@ -433,6 +433,7 @@ class AscendConfig:
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "mtp_memory_release": true,
+            "mtp_moe_sync": false,
             "enable_pcp_o_proj_weight_sharding": true,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
             "draft_window_size": null,
@@ -590,6 +591,22 @@ class AscendConfig:
     # at the peak. Lowers profile-run peak → more KV cache. Zero latency cost
     # (no synchronize; only reorders release timing). Default ON.
     mtp_memory_release: bool = True
+    # Plan-A: insert a torch.npu.synchronize() right before the MTP draft
+    # block's MoE workspace allocation. The Type-B async-lagged tensors
+    # (3b MTP-internal all_gather, 1b o_proj output, 4c input_layernorm
+    # output) are auto-rebound (freed) by upstream DeepseekV2DecoderLayer at
+    # the post_attention_layernorm / self_attn return — but the device-side
+    # frees only *enqueue* there and fire ~1 ms later, landing after the
+    # 1168 MB workspace alloc. Unlike Plan-D (which only helps the Type-A
+    # tensors whose refs survive past MoE), these Type-B tensors CANNOT be
+    # del'd earlier than their read dependency; a synchronize is the only
+    # way to force the enqueued frees to execute before the workspace alloc.
+    # Trade-off: one device sync per draft step (num_speculative_tokens
+    # times per request) — strictly more latency than Plan-D's zero-cost
+    # reorder, so it is a SEPARATE switch, default OFF. Enable when shaving
+    # the remaining ~281 MB (3 x 93.75) of peak co-residence is worth the
+    # per-draft-step sync. Stackable with mtp_memory_release.
+    mtp_moe_sync: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None

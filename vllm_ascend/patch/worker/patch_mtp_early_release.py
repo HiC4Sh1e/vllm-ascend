@@ -42,6 +42,18 @@ How:
 Future Plan:
     Remove once the async-free lag is handled in CANN or a reorder/sync strategy
     is upstreamed. See [[glm52-mtp-memory-peak-analysis]].
+
+Plan-A (mtp_moe_sync, default OFF):
+    Plan-D only recovers the *Type-A* async-lagged tensors (2 enorm-out, 1a
+    hnorm-out) whose refs survive past MoE. The *Type-B* tensors (3b MTP-
+    internal all_gather, 1b o_proj output, 4c input_layernorm output) are
+    auto-rebound at a read op *before* MoE (self_attn / post_attn_norm) — their
+    frees are already enqueued at the earliest legal point, so no del can move
+    them earlier; only a device sync can force the enqueued frees to execute
+    before the MoE workspace alloc. ``mtp_moe_sync`` inserts that sync right
+    before ``mtp_block``, recovering up to 3 x 93.75 = 281 MB more peak, at the
+    cost of one sync per draft step. It is a separate switch so the zero-latency
+    Plan-D can ship ON by default and Plan-A be opt-in when peak matters.
 """
 
 import logging
@@ -56,6 +68,12 @@ _logger = logging.getLogger(__name__)
 
 _OriginalPredictorLayerForward = _upstream_mtp.DeepSeekMultiTokenPredictorLayer.forward
 _OriginalPredictorForward = _upstream_mtp.DeepSeekMultiTokenPredictor.forward
+_OriginalPredictorLayerInit = _upstream_mtp.DeepSeekMultiTokenPredictorLayer.__init__
+
+# Marker: a DeepseekV2DecoderLayer that is the ``mtp_block`` of an MTP draft
+# layer. Only these layers should pay the Plan-A pre-MoE sync; the 77 regular
+# decoder layers must not.
+_MTP_BLOCK_MARKER = "_vllm_ascend_mtp_block_for_sync"
 
 
 def _mtp_memory_release_enabled() -> bool:
@@ -70,6 +88,22 @@ def _mtp_memory_release_enabled() -> bool:
         return getattr(get_ascend_config(), "mtp_memory_release", True)
     except RuntimeError:
         return True
+
+
+def _mtp_moe_sync_enabled() -> bool:
+    """Read the ``mtp_moe_sync`` additional-config switch at runtime.
+
+    Plan-A: a per-draft-step ``torch.npu.synchronize()`` before the MTP block's
+    MoE workspace alloc, to force the Type-B async-lagged frees (3b/1b/4c —
+    which Plan-D cannot move, since they are auto-rebound at a read op before
+    MoE) to actually execute before the 1168 MB workspace alloc. Default OFF
+    because a device sync costs latency on every draft step, unlike Plan-D's
+    zero-cost reorder. Falls back to False (the default field value).
+    """
+    try:
+        return getattr(get_ascend_config(), "mtp_moe_sync", False)
+    except RuntimeError:
+        return False
 
 
 def _plan_d_log(name: str, tensor: torch.Tensor | None) -> None:
@@ -87,6 +121,52 @@ def _plan_d_log(name: str, tensor: torch.Tensor | None) -> None:
         nbytes = -1
     _logger.info("[Plan-D] %s is released (shape=%s, bytes=%s)",
                  name, tuple(tensor.shape), nbytes)
+
+
+def _plan_a_sync_and_mlp(self_mlp, *args, **kwargs):
+    """Plan-A: synchronize before the MoE workspace alloc, then call mlp.
+
+    Bound per-instance on the MTP draft ``mtp_block.mlp`` only. The
+    ``post_attention_layernorm`` upstream call has already returned by the time
+    ``mlp`` is entered, so the auto-rebind frees of the Type-B async-lagged
+    tensors (3b / 1b / 4c) are enqueued on the stream. A synchronize here
+    drains them to the device *before* the 1168 MB MoE workspace is allocated
+    inside the original ``mlp.forward``. Gated by ``mtp_moe_sync`` at runtime.
+    """
+    if _mtp_moe_sync_enabled():
+        torch.npu.synchronize()
+        _logger.debug("[Plan-A] torch.npu.synchronize() before mtp_block MoE "
+                      "(recovers Type-B async-lagged 3b/1b/4c)")
+    orig = getattr(self_mlp, "_vllm_ascend_plan_a_orig_forward", None)
+    return orig(self_mlp, *args, **kwargs)
+
+
+def _plan_a_install_on_mtp_block(mtp_block):
+    """Tag an MTP draft ``mtp_block`` (a DeepseekV2DecoderLayer) and wrap its
+    ``mlp.forward`` with the Plan-A sync-first path. Idempotent."""
+    if mtp_block is None or getattr(mtp_block, _MTP_BLOCK_MARKER, False):
+        return
+    setattr(mtp_block, _MTP_BLOCK_MARKER, True)
+    mlp = getattr(mtp_block, "mlp", None)
+    if mlp is None:
+        return
+    # Cache the original forward on the instance (one per mlp object) and bind
+    # the sync-first wrapper. The wrapper reads the live switch every call.
+    if not hasattr(mlp, "_vllm_ascend_plan_a_orig_forward"):
+        mlp._vllm_ascend_plan_a_orig_forward = mlp.forward
+    import types as _types  # local import keeps the module import list clean
+    mlp.forward = _types.MethodType(_plan_a_sync_and_mlp, mlp)
+
+
+def _plan_a_predictor_layer_init(self, *args, **kwargs):
+    """Wrap DeepSeekMultiTokenPredictorLayer.__init__ to install Plan-A on its
+    ``mtp_block`` once it exists. The sync-first mlp wrapper reads the
+    ``mtp_moe_sync`` switch at every call, so installing it is harmless when
+    the switch is off — it just calls through to the original mlp.forward.
+    """
+    _OriginalPredictorLayerInit(self, *args, **kwargs)
+    mtp_block = getattr(self, "mtp_block", None)
+    _plan_a_install_on_mtp_block(mtp_block)
 
 
 def _plan_d_predictor_layer_forward(
@@ -182,11 +262,16 @@ def _plan_d_predictor_forward(
 
 
 def apply_patch() -> None:
-    """Install the Plan-D early-release forwards on the MTP predictor + layer.
+    """Install the Plan-D early-release forwards + Plan-A sync on the MTP
+    predictor + layer.
 
-    The forwards themselves read the ``mtp_memory_release`` AscendConfig switch
-    at runtime, so the monkey-patch is always installed unconditionally and the
-    switch gates the actual ``del`` + log behavior per call.
+    The patched forwards read the ``mtp_memory_release`` AscendConfig switch at
+    runtime, so the monkey-patch is always installed unconditionally and the
+    switch gates the actual ``del`` + log behavior per call. Plan-A wraps
+    ``DeepSeekMultiTokenPredictorLayer.__init__`` so each draft ``mtp_block``'s
+    ``mlp.forward`` gets a sync-first shim (gated at runtime by
+    ``mtp_moe_sync``); installing the shim when the switch is off is a no-op
+    pass-through to the original mlp.forward.
     """
     _upstream_mtp.DeepSeekMultiTokenPredictorLayer.forward = (
         _plan_d_predictor_layer_forward
@@ -194,10 +279,15 @@ def apply_patch() -> None:
     _upstream_mtp.DeepSeekMultiTokenPredictor.forward = (
         _plan_d_predictor_forward
     )
+    _upstream_mtp.DeepSeekMultiTokenPredictorLayer.__init__ = (
+        _plan_a_predictor_layer_init
+    )
     _logger.info(
         "[Plan-D] patched DeepSeekMultiTokenPredictor(Layer).forward "
         "(mtp_memory_release switch gates early release of "
-        "enorm/hnorm/embed outputs before MoE workspace alloc)"
+        "enorm/hnorm/embed outputs before MoE workspace alloc; "
+        "mtp_moe_sync switch gates a pre-MoE synchronize for Type-B "
+        "async-lagged tensors)"
     )
 
 
